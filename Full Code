@@ -1,0 +1,400 @@
+#include "I2Cdev.h"
+//#include "MPU6050_6Axis_MotionApps20.h"
+#include <Wire.h>
+#include "MPU6050_6Axis_MotionApps612.h" // Uncomment this library to work with DMP 6.12 and comment on the above library.
+#include <U8g2lib.h>
+#include <cmath> // Include the cmath library
+
+/* MPU6050 default I2C address is 0x68*/
+//MPU6050 mpu;
+//MPU6050 mpu(0x69); //Use for AD0 high
+MPU6050 mpu(0x68, &Wire1); //Use for AD0 low, but 2nd Wire (TWI/I2C) object.
+
+// Initialize the display
+U8G2_SSD1309_128X64_NONAME2_F_HW_I2C u8g2(U8G2_R0, /* clock=*/ 22, /* data=*/ 21);
+
+#define OUTPUT_READABLE_WORLDACCEL
+
+int const INTERRUPT_PIN = 2;  // Define the interruption #0 pin
+bool blinkState;
+
+/*---MPU6050 Control/Status Variables---*/
+bool DMPReady = true;  // Set true if DMP init was successful
+uint8_t MPUIntStatus;   // Holds actual interrupt status byte from MPU
+uint8_t devStatus;      // Return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // Expected DMP packet size (default is 42 bytes)
+uint8_t FIFOBuffer[64]; // FIFO storage buffer
+
+/*---Orientation/Motion Variables---*/
+Quaternion q;           // [w, x, y, z]         Quaternion container
+VectorInt16 aa;         // [x, y, z]            Accel sensor measurements
+VectorInt16 gy;         // [x, y, z]            Gyro sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            Gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            World-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            Gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   Yaw/Pitch/Roll container and gravity vector
+
+/*------Interrupt detection routine------*/
+volatile bool MPUInterrupt = false;     // Indicates whether MPU6050 interrupt pin has gone high
+void DMPDataReady() {
+  MPUInterrupt = true;
+}
+
+unsigned long updateInterval = 250;  // Update every 250 ms
+unsigned long previousMillis = 0;     // Stores last time the accelerometer values were updated
+// Declare the variables globally
+float WX, WY, WZ;
+
+float GWX, GWY; // set values for the gforce circle scaling
+unsigned long lastCheckTime = 0; // Last time the g-force check/reset occurred
+const unsigned long checkInterval = 15000; // 15 seconds
+float maxGForce = 0; // Track the maximum observed g-force
+float maxGForcePerm = 0;
+bool is2g = false; // bool to track if display circle should be at 1 or 2 g
+int threshold = 4000;
+int aaRealYPrev = 0;
+int aaRealxPrev = 0;
+int rollDegYPrev = 0;
+int rollDegXPrev = 0;
+
+// Set the center coordinates
+int centerX = 32;
+int centerY = 32;
+int radius = 30;
+int dotRadius = 3; // Adjust the radius of the dot as needed
+
+// First line: vertical
+int line1X1 = centerX; // Top of the circle
+int line1Y1 = centerY - radius;
+int line1X2 = centerX; // Bottom of the circle
+int line1Y2 = centerY + radius;
+
+// Second line: horizontal
+int line2X1 = centerX - radius; // Left side of the circle
+int line2Y1 = centerY;
+int line2X2 = centerX + radius; // Right side of the circle
+int line2Y2 = centerY;
+
+//calculate the average value for the disc
+float gForceLR = 0;
+float gForceUD = 0;
+float gForceLRAvg = 0;
+float gForceUDAvg = 0;
+float gForceLRPrev = 0;
+float gForceUDPrev = 0;
+
+float gForceDivision = 8192.0;
+int gCircleDivision = 596.0;
+
+float rollDegY = 0; //roll deg Y //LR rotation
+float rollDegX = 0; //roll deg X // front back rotation
+
+char buffer[9];
+
+void setup() {
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+  Wire1.begin(18, 19);
+  Wire1.setClock(400000); // 400kHz I2C clock. Comment on this line if having compilation difficulties
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+  Fastwire::setup(400, true);
+#endif
+
+  Serial.begin(115200); //115200 is required for Teapot Demo output
+  while (!Serial);
+
+  /*Initialize device*/
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize();
+
+  pinMode(INTERRUPT_PIN, INPUT);
+
+  /*Verify connection*/
+  Serial.println(F("Testing MPU6050 connection..."));
+  if (mpu.testConnection() == false) {
+    Serial.println("MPU6050 connection failed");
+    while (true);
+  }
+  else {
+    Serial.println("MPU6050 connection successful");
+  }
+
+  u8g2.begin();
+  if (!u8g2.begin()) {
+    Serial.println("Display initialization failed!");
+    while (1); // Halt the program if the display is not initialized.
+  } else {
+    Serial.println("Display initialized successfully.");
+    u8g2.setFont(u8g2_font_6x10_tr);
+  }
+  delay(500);
+
+  /* Initializate and configure the DMP */
+  Serial.println(F("Initializing DMP..."));
+  devStatus = mpu.dmpInitialize();
+
+  /* Supply your gyro offsets here, scaled for min sensitivity */
+  mpu.setXGyroOffset(0);
+  mpu.setYGyroOffset(0);
+  mpu.setZGyroOffset(0);
+  mpu.setXAccelOffset(0);
+  mpu.setYAccelOffset(0);
+  mpu.setZAccelOffset(0);
+
+  /* Making sure it worked (returns 0 if so) */
+  if (devStatus == 0) {
+    mpu.CalibrateAccel(6);  // Calibration Time: generate offsets and calibrate our MPU6050
+    mpu.CalibrateGyro(6);
+    Serial.println("These are the Active offsets: ");
+    mpu.PrintActiveOffsets();
+    Serial.println(F("Enabling DMP..."));   //Turning ON DMP
+    mpu.setDMPEnabled(true);
+
+    /*Enable Arduino interrupt detection*/
+    Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+    Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+    Serial.println(F(")..."));
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), DMPDataReady, RISING);
+    MPUIntStatus = mpu.getIntStatus();
+
+    /* Set the DMP Ready flag so the main loop() function knows it is okay to use it */
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    DMPReady = true;
+    packetSize = mpu.dmpGetFIFOPacketSize(); //Get expected DMP packet size for later comparison
+  }
+  else {
+    Serial.print(F("DMP Initialization failed (code ")); //Print the error code
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+  }
+  // Set accelerometer to ±4g
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_4); // only want 2G, however 4g will help stop interupt errors (when mpu maxes out)
+}
+
+void loop() {
+  if (!DMPReady) return; // Stop the program if DMP programming fails.
+
+  unsigned long currentMillis = millis();
+
+  /* Read a packet from FIFO */
+  if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer)) { // Get the Latest packet
+
+#ifdef OUTPUT_READABLE_WORLDACCEL
+    /* 
+    Display initial world-frame acceleration, adjusted to remove gravity
+      and rotated based on known orientation from Quaternion 
+     */
+    mpu.dmpGetQuaternion(&q, FIFOBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    mpu.dmpGetAccel(&aa, FIFOBuffer);
+    mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+    mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
+
+    // max realistic degrees is 45; at 6500 units
+    rollDegY = ((ypr[1] * 180 / M_PI) * 6550 / 45); // roll angle in degrees
+    rollDegX = ((ypr[2] * 180 / M_PI) * 6550 / 45); // roll angle in degrees
+
+    // adds threshhold value, another layer to avoid errors
+    if (abs(rollDegYPrev - rollDegYPrev) > threshold)
+    {
+      rollDegY = rollDegYPrev; //Ignore spike
+    } else {
+      rollDegYPrev = rollDegY;
+    }
+
+    if (abs(rollDegX - rollDegXPrev) > threshold)
+    {
+      rollDegX = rollDegXPrev; //Ignore spike
+    } else {
+      rollDegXPrev = rollDegX;
+    }
+
+    rollDegYPrev = rollDegY; // roll angle in degrees
+    rollDegXPrev = rollDegX; // roll angle in degrees
+
+    // Calculate the current g-force values
+    GWX = abs((aaReal.x + rollDegY) / gForceDivision);
+    GWY = abs((aaReal.y + rollDegX) / gForceDivision);
+    float currentGForce = max(GWX, GWY); // Use the larger of the two
+
+    // Update maxGForce if currentGForce exceeds it
+    if (currentGForce > maxGForce) {
+      if (currentGForce < 2) { // only change if its under 2g, stops errors
+        maxGForce = currentGForce;
+      }
+    }
+    if (currentGForce > maxGForcePerm) {
+      if (currentGForce < 2) { // only change if its under 2g, stops errors
+        maxGForcePerm = abs(currentGForce);
+      }
+    }
+    // adds threshhold value, another layer to avoid errors
+    if (abs(aaReal.y - aaRealYPrev) > threshold)
+    {
+      aaReal.y = aaRealYPrev; //Ignore spike
+    } else {
+      aaRealYPrev = aaReal.y;
+    }
+
+    if (abs(aaReal.x - aaRealxPrev) > threshold)
+    {
+      aaReal.x = aaRealxPrev; //Ignore spike
+    } else {
+      aaRealxPrev = aaReal.x;
+    }
+
+    // Check if check interval seconds have passed, and determine maxG
+    if (currentMillis - lastCheckTime >= checkInterval) {
+      if (maxGForce < 1) {
+        is2g = false;
+        //   Serial.println("false");  // Always print 'false' when g-force is less than 1g
+      } else {
+        is2g = true;
+        // Serial.println("true");   // Always print 'true' when g-force is greater than or equal to 1g
+      }
+      lastCheckTime = currentMillis;
+    }
+
+    // double check, mean that 2g will be active all the time, and 1g will only check every checkInterval seconds
+    if (maxGForce > 1) {
+      is2g = true;
+    }
+
+    //clear the buffer
+    u8g2.clearBuffer();
+    if (is2g) {
+      //draw lines representing .5, 1, 1.5 G's
+      gCircleDivision = 596.0; // Set for 2G scaling
+
+      // line 1
+      u8g2.drawArc(centerX, centerY, 8, -8, 8);
+      u8g2.drawArc(centerX, centerY, 8, 56, 72);
+      u8g2.drawArc(centerX, centerY, 8, 120, 136);
+      u8g2.drawArc(centerX, centerY, 8, 184, 200);
+
+      // line 2
+      u8g2.drawArc(centerX, centerY, 15, -6, 6);
+      u8g2.drawArc(centerX, centerY, 15, 58, 70);
+      u8g2.drawArc(centerX, centerY, 15, 122, 134);
+      u8g2.drawArc(centerX, centerY, 15, 186, 198);
+
+      // line 3
+      u8g2.drawArc(centerX, centerY, 23, -6, 6);
+      u8g2.drawArc(centerX, centerY, 23, 58, 70);
+      u8g2.drawArc(centerX, centerY, 23, 122, 134);
+      u8g2.drawArc(centerX, centerY, 23, 186, 198);
+
+      u8g2.drawStr(0, 62, "2g");  // Draw the text
+      //Serial.println("2g");
+
+    } else {
+    // always draw 2nd line
+    gCircleDivision = 596.0 / 2; // Set for 1G scaling
+    // line 2
+    u8g2.drawArc(centerX, centerY, 15, -6, 6);
+    u8g2.drawArc(centerX, centerY, 15, 58, 70);
+    u8g2.drawArc(centerX, centerY, 15, 122, 134);
+    u8g2.drawArc(centerX, centerY, 15, 186, 198);
+    u8g2.drawStr(0, 62, "1g");  // Draw the text
+    //Serial.println("1g");
+    }
+    //Serial.println(maxGForce);
+    // Reset maxGForce
+    maxGForce = 0;
+   
+    // Draw the two lines inside the larger circle
+    u8g2.drawLine(line1X1, line1Y1, line1X2, line1Y2); // Vertical line
+    u8g2.drawLine(line2X1, line2Y1, line2X2, line2Y2); // Horizontal line
+
+    // Draw a circle
+    u8g2.drawCircle(centerX, centerY, radius);
+
+    if (is2g) {
+      // Draw max radius circle
+      if (maxGForcePerm < 2)  {
+        u8g2.drawCircle(centerX, centerY, maxGForcePerm * gForceDivision / gCircleDivision);
+      }
+    } else {
+      // draw circle radius, but also check if is outside of normal circle radius
+      if (maxGForcePerm < 1) {
+        u8g2.drawCircle(centerX, centerY, maxGForcePerm * gForceDivision / gCircleDivision);
+      }
+    }
+
+    gForceLR = aaReal.y / gCircleDivision;
+    gForceUD = aaReal.x / gCircleDivision;
+
+    gForceLRAvg = ((gForceLR + gForceLRPrev) / 2) + rollDegX / gCircleDivision;
+    gForceUDAvg = ((gForceUD + gForceUDPrev) / 2) + rollDegY / gCircleDivision;
+
+    // draw the g-force dot
+    u8g2.drawDisc(centerX + gForceLRAvg, centerY + gForceUDAvg, dotRadius);
+
+    // draw the centre disk - avoids vibrations without all the jitter/hard movements
+    u8g2.drawDisc(centerX, centerY, 4);
+
+    gForceLRPrev = gForceLR;
+    gForceUDPrev = gForceUD;
+
+    // calculate and draw the numbers
+    if (currentMillis - previousMillis >= updateInterval) {
+
+      // calculate the values, if under 0.07, set to 0 (Minor filtering)
+      WX = (aaReal.x + rollDegY) / gForceDivision;
+      WY = (aaReal.y + rollDegX) / gForceDivision;
+
+      if (WX < 0.07) {
+        WX = 0.00;
+      }
+
+      if (WY < 0.07) {
+        WY = 0.00;
+      }
+
+      /* 
+      position and draw the text for current G-force in the forwards and sideways 
+      directions (X & Y respectively and the overall maximum g-force  
+      */
+
+      previousMillis = currentMillis; 
+      snprintf(buffer, sizeof(buffer), "Y:%6.2f", WX);
+      u8g2.setCursor(70, 10);  
+      u8g2.drawStr(70, 10, buffer);  
+
+      snprintf(buffer, sizeof(buffer), "X:%6.2f", WY);
+      u8g2.setCursor(70, 30); 
+      u8g2.drawStr(70, 30, buffer); 
+
+      snprintf(buffer, sizeof(buffer), "Max:%4.2f", maxGForcePerm);
+      u8g2.setCursor(70, 50);  
+      u8g2.drawStr(70, 50, buffer); 
+
+    } else {
+      snprintf(buffer, sizeof(buffer), "Y:%6.2f", WX);
+      u8g2.setCursor(70, 10); 
+      u8g2.drawStr(70, 10, buffer);  
+
+      snprintf(buffer, sizeof(buffer), "X:%6.2f", WY);
+      u8g2.setCursor(70, 30);  
+      u8g2.drawStr(70, 30, buffer); 
+
+      snprintf(buffer, sizeof(buffer), "Max:%4.2f", maxGForcePerm);
+      u8g2.setCursor(70, 50); 
+      u8g2.drawStr(70, 50, buffer);  
+    }
+
+    u8g2.sendBuffer();
+
+    Serial.print(aaReal.x);
+    Serial.print("\t");
+    Serial.print(aaReal.y);
+    Serial.print("\t");
+    Serial.print(-rollDegX);
+    Serial.print("\t");
+    Serial.println(-rollDegY);
+#endif
+  }
+}
