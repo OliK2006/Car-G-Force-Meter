@@ -1,9 +1,14 @@
+/* 
+https://github.com/ElectronicCats/mpu6050
+Main library code has been built on, use documentation from Electronic Cats to debug/change any sections
+*/
+
 #include "I2Cdev.h"
 //#include "MPU6050_6Axis_MotionApps20.h"
 #include <Wire.h>
 #include "MPU6050_6Axis_MotionApps612.h" // Uncomment this library to work with DMP 6.12 and comment on the above library.
 #include <U8g2lib.h>
-#include <cmath> // Include the cmath library
+#include <cmath> 
 
 /* MPU6050 default I2C address is 0x68*/
 //MPU6050 mpu;
@@ -15,7 +20,7 @@ U8G2_SSD1309_128X64_NONAME2_F_HW_I2C u8g2(U8G2_R0, /* clock=*/ 22, /* data=*/ 21
 
 #define OUTPUT_READABLE_WORLDACCEL
 
-int const INTERRUPT_PIN = 2;  // Define the interruption #0 pin
+int const INTERRUPT_PIN = 2;
 bool blinkState;
 
 /*---MPU6050 Control/Status Variables---*/
@@ -62,7 +67,7 @@ int rollDegXPrev = 0;
 int centerX = 32;
 int centerY = 32;
 int radius = 30;
-int dotRadius = 3; // Adjust the radius of the dot as needed
+int dotRadius = 3;
 
 // First line: vertical
 int line1X1 = centerX; // Top of the circle
@@ -84,11 +89,13 @@ float gForceUDAvg = 0;
 float gForceLRPrev = 0;
 float gForceUDPrev = 0;
 
+// Scaling for the screen and calculations
 float gForceDivision = 8192.0;
 int gCircleDivision = 596.0;
 
-float rollDegY = 0; //roll deg Y //LR rotation
-float rollDegX = 0; //roll deg X // front back rotation
+// Calculate roll degree to help minimise false readings from change in angle
+float rollDegY = 0; //roll deg Y, LR rotation
+float rollDegX = 0; //roll deg X, front back rotation
 
 char buffer[9];
 
@@ -100,7 +107,7 @@ void setup() {
   Fastwire::setup(400, true);
 #endif
 
-  Serial.begin(115200); //115200 is required for Teapot Demo output
+  Serial.begin(115200);
   while (!Serial);
 
   /*Initialize device*/
